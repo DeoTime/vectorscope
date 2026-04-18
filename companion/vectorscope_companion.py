@@ -30,10 +30,10 @@ Controls (left panel)
 
 Usage
 ─────
-    python vectorscope_companion.py [trigger_file_path]
+    python vectorscope_companion.py [trigger_file_path] [--watch-path PATH]
 
 If trigger_file_path is omitted the app can load an image manually via
-File > Open Image.
+File > Open Image, or watch a standalone file/folder with --watch-path.
 
 Dependencies: Pillow, NumPy, Matplotlib (see requirements.txt)
 """
@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +59,7 @@ from tkinter import ttk, filedialog, messagebox
 from vectorscope_renderer import VectorscopeRenderer
 from skin_tone_detector import SkinToneDetector, SkinRange, ETHNIC_RANGES
 from color_utils import SKIN_TONE_ANGLE_YCBCR_RAD, ycbcr_to_polar, rgb_to_ycbcr, rgb_to_hsv
+from live_update import DebounceGate, file_marker, parse_trigger_image_path, resolve_watch_image
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +69,8 @@ from color_utils import SKIN_TONE_ANGLE_YCBCR_RAD, ycbcr_to_polar, rgb_to_ycbcr,
 POLL_INTERVAL_MS   = 500      # How often to check the trigger file (ms)
 MAX_PIXELS         = 400_000  # Downsample threshold for vectorscope rendering
 WINDOW_TITLE       = 'Vectorscope – Skin Tone Analyzer'
+DEBOUNCE_SECONDS   = 0.25
+MIN_UPDATE_SECONDS = 0.50
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +121,23 @@ def load_image(path: str) -> np.ndarray | None:
 class VectorscopeApp:
     """Main Tkinter application window."""
 
-    def __init__(self, root: tk.Tk, trigger_path: str | None = None) -> None:
-        self.root          = root
-        self.trigger_path  = trigger_path
-        self._last_trigger = None   # last trigger file mtime
-        self._current_rgb  = None  # most recently loaded image
-        self._detector     = SkinToneDetector()
-        self._detection    = None
+    def __init__(
+        self,
+        root: tk.Tk,
+        trigger_path: str | None = None,
+        watch_path: str | None = None,
+    ) -> None:
+        self.root                 = root
+        self.trigger_path         = trigger_path
+        self._suppressed_watch_path = watch_path if (trigger_path and watch_path) else None
+        self.watch_path           = watch_path if trigger_path is None else None
+        self._current_rgb         = None  # most recently loaded image
+        self._detector            = SkinToneDetector()
+        self._detection           = None
+
+        self._trigger_gate = DebounceGate(DEBOUNCE_SECONDS, MIN_UPDATE_SECONDS)
+        self._watch_gate   = DebounceGate(DEBOUNCE_SECONDS, MIN_UPDATE_SECONDS)
+        self._last_watch_image: Path | None = None
 
         root.title(WINDOW_TITLE)
         root.configure(bg='#1a1a1a')
@@ -258,7 +272,14 @@ class VectorscopeApp:
             command=self._refresh,
         ).pack(fill=tk.X, padx=14, pady=4)
 
-        # ── Status bar ──
+        # ── Status section ──
+        self._last_update_var = tk.StringVar(value='Last update: none')
+        tk.Label(
+            parent, textvariable=self._last_update_var,
+            bg='#111', fg='#7ec8ff', font=('Helvetica', 8),
+            wraplength=190, justify=tk.LEFT, anchor='nw',
+        ).pack(fill=tk.X, padx=8, pady=(12, 2), side=tk.BOTTOM)
+
         self._status_var = tk.StringVar(
             value='Ready. Open an image or wait for Lightroom.',
         )
@@ -266,7 +287,7 @@ class VectorscopeApp:
             parent, textvariable=self._status_var,
             bg='#111', fg='#aaa', font=('Helvetica', 8),
             wraplength=190, justify=tk.LEFT, anchor='nw',
-        ).pack(fill=tk.X, padx=8, pady=(12, 4), side=tk.BOTTOM)
+        ).pack(fill=tk.X, padx=8, pady=(2, 4), side=tk.BOTTOM)
 
     def _build_canvas(self, parent: tk.Frame) -> None:
         """Create the Matplotlib figure and embed it in a Tkinter canvas."""
@@ -279,6 +300,14 @@ class VectorscopeApp:
     # ------------------------------------------------------------------
     # Settings / event handlers
     # ------------------------------------------------------------------
+
+    def _set_status(self, text: str) -> None:
+        self._status_var.set(text)
+
+    def _mark_update(self, source: str, path: str | None = None) -> None:
+        ts = datetime.now(timezone.utc).astimezone().strftime('%H:%M:%S')
+        suffix = f' – {Path(path).name}' if path else ''
+        self._last_update_var.set(f'Last update: {ts} ({source}){suffix}')
 
     def _on_settings_changed(self) -> None:
         """Called whenever a control value changes; re-renders if image loaded."""
@@ -294,9 +323,9 @@ class VectorscopeApp:
     def _refresh(self) -> None:
         """Manually trigger a re-render with the current image."""
         if self._current_rgb is not None:
-            self._detect_and_render(self._current_rgb)
+            self._detect_and_render(self._current_rgb, source='Manual refresh')
         else:
-            self._status_var.set('No image loaded.')
+            self._set_status('No image loaded.')
 
     # ------------------------------------------------------------------
     # Image loading
@@ -312,21 +341,26 @@ class VectorscopeApp:
             ],
         )
         if path:
-            self._load_and_render(path)
+            self._load_and_render(path, source='Manual open')
 
-    def _load_and_render(self, path: str) -> None:
+    def _load_and_render(self, path: str, source: str = 'Image load') -> None:
         """Load an image from disk and render the vectorscope."""
-        self._status_var.set(f'Loading {Path(path).name}…')
+        self._set_status(f'Loading {Path(path).name}…')
         rgb = load_image(path)
         if rgb is None:
-            self._status_var.set('Failed to load image.')
+            self._set_status('Failed to load image.')
             return
-        self._detect_and_render(rgb)
-        self._status_var.set(
+        self._detect_and_render(rgb, source=source, path=path)
+        self._set_status(
             f'Loaded: {Path(path).name}  ({rgb.shape[1]}×{rgb.shape[0]} px)',
         )
 
-    def _detect_and_render(self, rgb: np.ndarray) -> None:
+    def _detect_and_render(
+        self,
+        rgb: np.ndarray,
+        source: str = 'Update',
+        path: str | None = None,
+    ) -> None:
         """Run skin detection and render the vectorscope."""
         self._current_rgb = rgb
 
@@ -342,6 +376,7 @@ class VectorscopeApp:
             self._detection = None
 
         self._render()
+        self._mark_update(source, path=path)
 
     def _render(self) -> None:
         """Render the vectorscope with current settings."""
@@ -358,29 +393,69 @@ class VectorscopeApp:
         )
 
     # ------------------------------------------------------------------
-    # File watcher (polls trigger file on the Tk event loop)
+    # Input watchers (trigger file and optional standalone watch-path)
     # ------------------------------------------------------------------
 
     def _start_file_watcher(self) -> None:
-        """Start polling the trigger file for changes."""
+        """Start polling configured live-update sources."""
         if self.trigger_path:
-            self._poll_trigger()
+            self._set_status('Lightroom trigger mode active.')
+            if self._suppressed_watch_path:
+                print(
+                    '[companion] --watch-path ignored because trigger_file mode is active.',
+                    file=sys.stderr,
+                )
+        elif self.watch_path:
+            self._set_status(f'Standalone watch mode active: {self.watch_path}')
+        self._poll_inputs()
 
-    def _poll_trigger(self) -> None:
-        """Check if the trigger file has changed; if so reload the image."""
-        if self.trigger_path and Path(self.trigger_path).exists():
-            try:
-                mtime = Path(self.trigger_path).stat().st_mtime
-                if mtime != self._last_trigger:
-                    self._last_trigger = mtime
-                    content  = Path(self.trigger_path).read_text().strip().splitlines()
-                    img_path = content[-1].strip() if content else ''
-                    if img_path and Path(img_path).exists():
-                        self._load_and_render(img_path)
-            except Exception as exc:
-                print(f'[companion] Trigger file error: {exc}')
+    def _poll_inputs(self) -> None:
+        """Check all update sources and load changed images."""
+        self._poll_trigger_source()
+        self._poll_watch_source()
+        self.root.after(POLL_INTERVAL_MS, self._poll_inputs)
 
-        self.root.after(POLL_INTERVAL_MS, self._poll_trigger)
+    def _poll_trigger_source(self) -> None:
+        """Handle Lightroom trigger-file updates."""
+        if not self.trigger_path:
+            return
+
+        trigger_file = Path(self.trigger_path)
+        marker = file_marker(trigger_file)
+        if not self._trigger_gate.update(marker):
+            return
+
+        try:
+            img_path = parse_trigger_image_path(trigger_file.read_text())
+            if img_path and Path(img_path).exists():
+                self._load_and_render(img_path, source='Lightroom trigger')
+            else:
+                self._set_status('Trigger updated, but no valid image path found.')
+        except Exception as exc:
+            print(f'[companion] Trigger file error: {exc}')
+
+    def _poll_watch_source(self) -> None:
+        """Handle standalone watch-path updates (file or folder)."""
+        if self.trigger_path or not self.watch_path:
+            return
+
+        watch_target = Path(self.watch_path)
+        try:
+            image_path = resolve_watch_image(watch_target)
+            marker = (
+                str(image_path),
+                file_marker(image_path) if image_path else None,
+            )
+            if not self._watch_gate.update(marker):
+                return
+
+            if image_path and image_path.exists():
+                self._last_watch_image = image_path
+                self._load_and_render(str(image_path), source='Standalone watch')
+            else:
+                self._set_status(f'Waiting for image files in: {watch_target}')
+        except Exception as exc:
+            print(f'[companion] Watch-path error: {exc}')
 
     # ------------------------------------------------------------------
     # Export analysis
@@ -483,21 +558,24 @@ def main() -> None:
         'trigger_file', nargs='?', default=None,
         help='Path to the IPC trigger file written by the Lightroom plugin.',
     )
+    parser.add_argument(
+        '--watch-path', default=None,
+        help='Standalone mode: watch an image file or folder for live updates.',
+    )
     args = parser.parse_args()
 
     trigger = args.trigger_file
     _write_pid_file(trigger)
 
     root = tk.Tk()
-    app  = VectorscopeApp(root, trigger_path=trigger)
+    app  = VectorscopeApp(root, trigger_path=trigger, watch_path=args.watch_path)
 
     # If a trigger file already contains a valid image path, load it now
     if trigger and Path(trigger).exists():
         try:
-            content  = Path(trigger).read_text().strip().splitlines()
-            img_path = content[-1].strip() if content else ''
+            img_path = parse_trigger_image_path(Path(trigger).read_text())
             if img_path and Path(img_path).exists():
-                app._load_and_render(img_path)
+                app._load_and_render(img_path, source='Initial trigger')
         except Exception:
             pass
 
@@ -506,4 +584,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-

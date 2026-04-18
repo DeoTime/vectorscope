@@ -8,7 +8,7 @@ A vectorscope-style visualization tool for analyzing skin tones in
    selected image and launches / signals the companion app.
 2. **Python companion app** (`companion/`) – standalone GUI application
    (Tkinter + Matplotlib + Pillow + NumPy) that renders the vectorscope,
-   detects skin tones, and shows live statistics.
+   detects skin tones, and shows live statistics with update-source metadata.
 
 ---
 
@@ -66,8 +66,8 @@ A vectorscope-style visualization tool for analyzing skin tones in
 
 1. Plugin exports a JPEG preview to `vectorscope_tmp/vectorscope_preview.jpg`.
 2. Plugin writes the image path + timestamp to `vectorscope_tmp/vectorscope_trigger.txt`.
-3. Companion app polls the trigger file every 500 ms; when the mtime changes it
-   reloads the image and re-renders the vectorscope.
+3. Companion app polls the trigger file every 500 ms; when the trigger changes it
+   reloads the image and re-renders the vectorscope (with debounce/throttle).
 4. Companion app writes its PID to `vectorscope_tmp/companion.pid` so the
    plugin can detect whether the app is already running.
 
@@ -102,6 +102,12 @@ The plugin calls `python3 companion/vectorscope_companion.py <trigger_file>`
 (on macOS/Linux) or `pythonw companion/vectorscope_companion.py <trigger_file>`
 (on Windows).
 
+Standalone live watch mode is also available:
+
+```bash
+python companion/vectorscope_companion.py --watch-path /path/to/image-or-folder
+```
+
 **Tip:** To avoid managing a virtual environment, you can install the
 packages globally or use `pipx`.
 
@@ -113,10 +119,11 @@ packages globally or use `pipx`.
 
 1. Select a photo in the Library or Develop module.
 2. Go to **File > Plug-in Extras > Open Vectorscope Analyzer**.
-3. The control dialog opens.  Click **Analyse Current Photo**.
-4. Lightroom exports a JPEG preview and the companion app window opens
-   (or, if already open, updates automatically).
-5. Switch to another photo and click **Analyse** again to refresh.
+3. The control dialog opens with **Auto Live mode enabled**.
+4. Lightroom exports a JPEG preview automatically whenever the selected photo
+   or core develop settings change (debounced + throttled).
+5. Use **Refresh Now** for manual fallback, or **Stop Live / Start Live**
+   to control automatic updates.
 
 ### Standalone (without Lightroom)
 
@@ -125,6 +132,13 @@ python companion/vectorscope_companion.py
 ```
 
 Use **File > Open Image…** to load any JPEG, PNG, TIFF, or BMP file.
+Or use:
+
+```bash
+python companion/vectorscope_companion.py --watch-path /path/to/image-or-folder
+```
+
+to continuously monitor one image file or the newest image inside a folder.
 
 ---
 
@@ -222,6 +236,7 @@ and can be exported to a text file via **File > Export Analysis…**.
 | **Zoom** | Scale the vectorscope radius axis (0.5×–4×) |
 | **Skin range** | Filter detection to a specific Fitzpatrick range |
 | **Refresh** | Re-render with current settings |
+| **Last update** | Shows timestamp + source (manual, Lightroom trigger, watch mode) |
 | **File > Open Image…** | Load any image manually |
 | **File > Export Analysis…** | Save analysis statistics to a `.txt` file |
 

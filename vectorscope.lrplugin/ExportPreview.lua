@@ -62,17 +62,22 @@ end
 --- Export the currently selected photo as a JPEG preview.
 --
 -- @param  progressScope  (optional) LrProgressScope to update
+-- @param  options        (optional) table:
+--                        - silentNoPhoto: suppress no-photo dialog if true
 -- @return string | nil   Absolute path to the exported JPEG, or nil on error
-function ExportPreview.exportCurrentPhoto(progressScope)
+function ExportPreview.exportCurrentPhoto(progressScope, options)
+  options = options or {}
   local catalog    = LrApplication.activeCatalog()
   local photo      = catalog:getTargetPhoto()
 
   if not photo then
-    LrDialogs.message(
-      'Vectorscope',
-      'Please select a photo in the Library or Develop module first.',
-      'info'
-    )
+    if not options.silentNoPhoto then
+      LrDialogs.message(
+        'Vectorscope',
+        'Please select a photo in the Library or Develop module first.',
+        'info'
+      )
+    end
     return nil
   end
 

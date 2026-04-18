@@ -43,7 +43,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -127,12 +127,13 @@ class VectorscopeApp:
         trigger_path: str | None = None,
         watch_path: str | None = None,
     ) -> None:
-        self.root         = root
-        self.trigger_path = trigger_path
-        self.watch_path   = watch_path if trigger_path is None else None
-        self._current_rgb = None  # most recently loaded image
-        self._detector    = SkinToneDetector()
-        self._detection   = None
+        self.root                 = root
+        self.trigger_path         = trigger_path
+        self._suppressed_watch_path = watch_path if (trigger_path and watch_path) else None
+        self.watch_path           = watch_path if trigger_path is None else None
+        self._current_rgb         = None  # most recently loaded image
+        self._detector            = SkinToneDetector()
+        self._detection           = None
 
         self._trigger_gate = DebounceGate(DEBOUNCE_SECONDS, MIN_UPDATE_SECONDS)
         self._watch_gate   = DebounceGate(DEBOUNCE_SECONDS, MIN_UPDATE_SECONDS)
@@ -304,7 +305,7 @@ class VectorscopeApp:
         self._status_var.set(text)
 
     def _mark_update(self, source: str, path: str | None = None) -> None:
-        ts = datetime.now().strftime('%H:%M:%S')
+        ts = datetime.now(timezone.utc).astimezone().strftime('%H:%M:%S')
         suffix = f' – {Path(path).name}' if path else ''
         self._last_update_var.set(f'Last update: {ts} ({source}){suffix}')
 
@@ -399,6 +400,11 @@ class VectorscopeApp:
         """Start polling configured live-update sources."""
         if self.trigger_path:
             self._set_status('Lightroom trigger mode active.')
+            if self._suppressed_watch_path:
+                print(
+                    '[companion] --watch-path ignored because trigger_file mode is active.',
+                    file=sys.stderr,
+                )
         elif self.watch_path:
             self._set_status(f'Standalone watch mode active: {self.watch_path}')
         self._poll_inputs()

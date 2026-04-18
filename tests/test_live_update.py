@@ -45,8 +45,8 @@ def test_resolve_watch_image_directory_picks_latest_image(tmp_path: Path):
     other.write_text('nope')
 
     # Ensure deterministic mtime ordering.
-    older.touch()
-    newer.touch()
+    os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
 
     assert resolve_watch_image(tmp_path) == newer
 

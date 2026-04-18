@@ -20,7 +20,7 @@ def parse_trigger_image_path(text: str) -> str | None:
 
 
 def file_marker(path: Path) -> tuple[int, int] | None:
-    """Return a stable marker tuple for a file or None when unavailable."""
+    """Return (mtime_ns, size) for change detection, or None when unavailable."""
     try:
         stat = path.stat()
     except OSError:
@@ -36,11 +36,23 @@ def resolve_watch_image(path: Path) -> Path | None:
     if not path.is_dir():
         return None
 
-    candidates = [p for p in path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
-    if not candidates:
+    newest = None
+    newest_mtime = None
+    for candidate in path.iterdir():
+        if not candidate.is_file() or candidate.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        try:
+            mtime = candidate.stat().st_mtime_ns
+        except OSError:
+            continue
+        if newest is None or mtime > newest_mtime:
+            newest = candidate
+            newest_mtime = mtime
+
+    if newest is None:
         return None
 
-    return max(candidates, key=lambda p: p.stat().st_mtime_ns)
+    return newest
 
 
 class DebounceGate:

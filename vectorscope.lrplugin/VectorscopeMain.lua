@@ -49,6 +49,8 @@ local state = {
 -- Live-mode constants
 -- ---------------------------------------------------------------------------
 
+-- Poll and debounce are intentionally aligned so one stable poll cycle
+-- is enough to coalesce quick slider drags into a single export.
 local LIVE_POLL_INTERVAL_SEC      = 0.35
 local LIVE_DEBOUNCE_SEC           = 0.35
 local LIVE_MIN_EXPORT_INTERVAL_SEC = 1.0
@@ -311,8 +313,6 @@ local function showControlDialog()
       contents = contents,
       resizable = false,
     })
-
-    stopLiveLoop()
   end)
 end
 

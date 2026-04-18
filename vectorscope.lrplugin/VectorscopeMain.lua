@@ -21,6 +21,7 @@
 local LrApplication    = import 'LrApplication'
 local LrBinding        = import 'LrBinding'
 local LrColor          = import 'LrColor'
+local LrDate           = import 'LrDate'
 local LrDialogs        = import 'LrDialogs'
 local LrFunctionContext = import 'LrFunctionContext'
 local LrTasks          = import 'LrTasks'
@@ -37,9 +38,69 @@ log:enable('print')
 -- State shared between UI and background task
 -- ---------------------------------------------------------------------------
 local state = {
-  status      = 'Ready.',   -- Status line shown in the dialog
-  isUpdating  = false,      -- Prevents concurrent exports
+  status             = 'Ready.',                      -- Status line shown in the dialog
+  isUpdating         = false,                         -- Prevents concurrent exports
+  liveEnabled        = true,                          -- Live mode default
+  liveLoopGeneration = 0,                             -- Cancels stale loops
+  liveButtonTitle    = 'Stop Live',
 }
+
+-- ---------------------------------------------------------------------------
+-- Live-mode constants
+-- ---------------------------------------------------------------------------
+
+local LIVE_POLL_INTERVAL_SEC      = 0.35
+local LIVE_DEBOUNCE_SEC           = 0.35
+local LIVE_MIN_EXPORT_INTERVAL_SEC = 1.0
+
+-- ---------------------------------------------------------------------------
+-- Helpers
+-- ---------------------------------------------------------------------------
+
+local function setStatus(props, text)
+  state.status = text
+  if props then
+    props.status = text
+  end
+end
+
+local function setLiveEnabled(props, enabled)
+  state.liveEnabled = enabled
+  state.liveButtonTitle = enabled and 'Stop Live' or 'Start Live'
+  if props then
+    props.liveButtonTitle = state.liveButtonTitle
+  end
+end
+
+local function getPhotoFingerprint()
+  local catalog = LrApplication.activeCatalog()
+  local photo   = catalog:getTargetPhoto()
+  if not photo then
+    return nil
+  end
+
+  local parts = {
+    tostring(photo:getRawMetadata('path') or ''),
+    tostring(photo:getRawMetadata('fileName') or ''),
+  }
+
+  local ok, settings = pcall(function()
+    return photo:getDevelopSettings()
+  end)
+  if ok and settings then
+    local keys = {
+      'Exposure2012', 'Contrast2012', 'Highlights2012', 'Shadows2012',
+      'Whites2012', 'Blacks2012', 'Temp', 'Tint', 'Vibrance', 'Saturation',
+      'Clarity2012', 'Dehaze', 'Sharpness', 'LuminanceSmoothing',
+      'SplitToningBalance', 'ColorNoiseReduction',
+    }
+    for _, key in ipairs(keys) do
+      parts[#parts + 1] = key .. '=' .. tostring(settings[key])
+    end
+  end
+
+  return table.concat(parts, '|')
+end
 
 -- ---------------------------------------------------------------------------
 -- Background export + launch task
@@ -47,38 +108,53 @@ local state = {
 
 --- Export the current photo and (re)launch / signal the companion.
 -- Runs inside LrTasks.startAsyncTask so Lightroom does not block.
-local function runAnalysis(progressScope)
+local function runAnalysis(opts)
+  opts = opts or {}
   if state.isUpdating then return end
   state.isUpdating = true
-  state.status     = 'Exporting preview…'
+  local showProgress = opts.showProgress ~= false
+  local statusPrefix = opts.statusPrefix or 'Updating vectorscope'
+  local props = opts.props
+  setStatus(props, statusPrefix .. '…')
 
   LrFunctionContext.callWithContext('VectorscopeExport', function(context)
-    local progress = LrDialogs.showModalProgressDialog({
-      title   = 'Vectorscope – Exporting Preview',
-      caption = 'Preparing image for analysis…',
-      width   = 300,
-      cannotCancel = false,
-      functionContext = context,
-    })
+    local progress = nil
+    if showProgress then
+      progress = LrDialogs.showModalProgressDialog({
+        title   = 'Vectorscope – Exporting Preview',
+        caption = 'Preparing image for analysis…',
+        width   = 300,
+        cannotCancel = false,
+        functionContext = context,
+      })
+    end
 
     -- Export JPEG preview
-    local previewPath = ExportPreview.exportCurrentPhoto(progress)
+    local previewPath = ExportPreview.exportCurrentPhoto(progress, {
+      silentNoPhoto = opts.silentNoPhoto == true,
+    })
     if not previewPath then
-      state.status     = 'Export failed. Please select a photo and try again.'
+      if opts.noPhotoStatus then
+        setStatus(props, opts.noPhotoStatus)
+      else
+        setStatus(props, 'Export failed. Please select a photo and try again.')
+      end
       state.isUpdating = false
       return
     end
 
-    progress:setCaption('Launching companion app…')
+    if progress then
+      progress:setCaption('Launching companion app…')
+    end
 
     -- Ensure companion is running, then signal it
     local triggerPath = ExportPreview.getTriggerPath()
     local ok = CompanionBridge.ensureRunning(triggerPath)
     if ok then
       CompanionBridge.signalReload(previewPath, triggerPath)
-      state.status = 'Vectorscope updated. See the companion window.'
+      setStatus(props, statusPrefix .. ' complete.')
     else
-      state.status = 'Could not start companion app.'
+      setStatus(props, 'Could not start companion app.')
     end
 
     state.isUpdating = false
@@ -95,6 +171,64 @@ local function showControlDialog()
     local f        = LrView.osFactory()
     local props    = LrBinding.makePropertyTable(context)
     props.status   = state.status
+    props.liveButtonTitle = state.liveButtonTitle
+
+    local function startLiveLoop()
+      if not state.liveEnabled then
+        return
+      end
+
+      state.liveLoopGeneration = state.liveLoopGeneration + 1
+      local generation = state.liveLoopGeneration
+      setStatus(props, 'Live mode enabled. Watching Lightroom changes…')
+
+      LrTasks.startAsyncTask(function()
+        local lastFingerprint = nil
+        local pendingSince    = nil
+        local lastExportAt    = 0
+
+        while state.liveEnabled and generation == state.liveLoopGeneration do
+          local now = LrDate.currentTime()
+          local fingerprint = getPhotoFingerprint()
+
+          if fingerprint ~= lastFingerprint then
+            lastFingerprint = fingerprint
+            pendingSince    = now
+            if not fingerprint then
+              setStatus(props, 'Live mode: no selected photo.')
+            else
+              setStatus(props, 'Live mode: change detected, waiting for settle…')
+            end
+          end
+
+          if fingerprint and pendingSince
+             and (now - pendingSince) >= LIVE_DEBOUNCE_SEC
+             and (now - lastExportAt) >= LIVE_MIN_EXPORT_INTERVAL_SEC then
+            runAnalysis({
+              showProgress = false,
+              statusPrefix = 'Live update',
+              props = props,
+              silentNoPhoto = true,
+              noPhotoStatus = 'Live mode: no selected photo.',
+            })
+            lastExportAt = LrDate.currentTime()
+            pendingSince = nil
+          end
+
+          LrTasks.sleep(LIVE_POLL_INTERVAL_SEC)
+        end
+
+        if generation == state.liveLoopGeneration then
+          setStatus(props, 'Live mode stopped.')
+        end
+      end)
+    end
+
+    local function stopLiveLoop()
+      setLiveEnabled(props, false)
+      state.liveLoopGeneration = state.liveLoopGeneration + 1
+      setStatus(props, 'Live mode stopped. Use "Refresh Now" or restart live mode.')
+    end
 
     -- Layout
     local contents = f:column({
@@ -112,9 +246,9 @@ local function showControlDialog()
 
       -- Instructions
       f:static_text({
-        title = 'Select a photo in the Library or Develop module,\n'
-              .. 'then press "Analyze" to open the vectorscope\n'
-              .. 'in the external companion window.',
+        title = 'Auto Live mode is enabled by default.\n'
+              .. 'Adjust the selected photo in Lightroom and\n'
+              .. 'the companion vectorscope updates automatically.',
         height_in_lines = 3,
         fill_horizontal = 1,
       }),
@@ -135,13 +269,27 @@ local function showControlDialog()
         fill_horizontal = 1,
 
         f:push_button({
-          title  = 'Analyze Current Photo',
+          title = LrView.bind('liveButtonTitle'),
           action = function()
-            props.status   = 'Exporting…'
-            state.status   = 'Exporting…'
+            if state.liveEnabled then
+              stopLiveLoop()
+            else
+              setLiveEnabled(props, true)
+              startLiveLoop()
+            end
+          end,
+        }),
+
+        f:push_button({
+          title  = 'Refresh Now',
+          action = function()
             LrTasks.startAsyncTask(function()
-              runAnalysis()
-              props.status = state.status
+              runAnalysis({
+                showProgress = true,
+                statusPrefix = 'Manual refresh',
+                props = props,
+                silentNoPhoto = false,
+              })
             end)
           end,
         }),
@@ -149,6 +297,7 @@ local function showControlDialog()
         f:push_button({
           title  = 'Close',
           action = function()
+            stopLiveLoop()
             LrDialogs.stopModalWithResult(contents, 'ok')
           end,
         }),
@@ -162,6 +311,8 @@ local function showControlDialog()
       contents = contents,
       resizable = false,
     })
+
+    stopLiveLoop()
   end)
 end
 

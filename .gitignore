@@ -1,0 +1,33 @@
+# Build artifacts and temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Lightroom plugin cache / temp exports
+vectorscope_tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test output / coverage
+.coverage
+htmlcov/
+.pytest_cache/

@@ -1,0 +1,14 @@
+# Vectorscope Companion App – Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+#
+# All packages are widely available and well-maintained.
+
+# Image I/O and basic manipulation
+Pillow>=9.0.0
+
+# Fast numerical computation (array math for colour conversion, statistics)
+numpy>=1.23.0
+
+# Plotting (vectorscope density plot, skin-tone overlays)
+matplotlib>=3.6.0
